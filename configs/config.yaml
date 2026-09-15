@@ -1,0 +1,58 @@
+project:
+  seed: 42
+  num_workers: 4
+  device: cuda
+  amp: true
+
+paths:
+  annotation_root: /2026aicompetition/datasets/training/annotation
+  labels_dir: ./labels
+  checkpoints_dir: ./checkpoints
+  output_dir: ./outputs
+  competition_log_dir: /2026aicompetition/workspace/logs
+  answer_root: /2026aicompetition/workspace/answer
+
+data:
+  target_shape: [96, 128, 128]
+  intensity_clip_percentiles: [0.5, 99.5]
+
+split:
+  val_ratio: 0.1
+  random_state: 42
+
+training:
+  batch_size: 2
+  epochs: 20
+  lr: 0.0003
+  weight_decay: 0.00001
+  log_every: 10
+
+abnormal:
+  num_classes: 3
+
+sequence:
+  num_classes: 3
+
+segmentation:
+  base_channels: 16
+
+characteristics:
+  feature_dim: 128
+  modality_dropout: 0.25
+
+duplicate:
+  embedding_dim: 128
+  negative_ratio: 3
+  topk_candidates: 50
+  margin: 0.25
+
+service:
+  host: 0.0.0.0
+  port: 8000
+  callback_url: ""
+
+validation_simulation:
+  enabled: true
+  ratio: 0.1
+  random_state: 42
+  output_subdir: validation_simulation

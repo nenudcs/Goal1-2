@@ -1,0 +1,15 @@
+__pycache__/
+.idea/
+*.pyc
+.pytest_cache/
+.venv/
+cache/
+checkpoints/
+jobs/
+answer/
+*.pt
+*.pth
+*.npz
+*.dcm
+*.nii
+*.nii.gz

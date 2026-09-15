@@ -1,0 +1,68 @@
+project:
+  seed: 42
+  device: cuda
+  amp: true
+  num_workers: 4
+
+paths:
+  annotation_root: /2026aicompetition/datasets/training/annotation
+  labels_dir: ./labels
+  checkpoints_dir: ./checkpoints_detection
+  output_dir: ./outputs_detection
+  cache_dir: ./outputs_detection/cache
+  manifest: ./outputs_detection/manifest.json
+  competition_log_dir: /2026aicompetition/workspace/logs
+  answer_root: /2026aicompetition/workspace/answer
+  jobs_dir: ./outputs_detection/jobs
+
+detection:
+  enabled: true
+  models:
+    convnext_repo: /2026aicompetition/public_models/facebookresearch/ConvNeXt
+    convnext_weights: /2026aicompetition/public_models/FoundationVision/convnext_tiny_1k_224_ema.pth
+    dino_repo: /2026aicompetition/public_models/facebookresearch/dinov2
+    dino_weights: /2026aicompetition/public_models/facebookresearch/dinov2/dinov2_vits14_pretrain.pth
+  data:
+    negative_policy: unknown
+    negative_pair_file: null
+    closed_world_ids_file: null
+    split_file: null
+    patient_metadata_file: null
+    seed: 42
+    ratios: [0.8, 0.1, 0.1]
+  abnormal:
+    view_size: 224
+    tile_stride: 112
+    bag_views: 64
+    microbatch: 16
+    attention_dim: 128
+    freeze_epochs: 5
+    head_lr: 0.0003
+    backbone_lr: 0.00001
+    weight_decay: 0.01
+    patience: 10
+    max_epochs: null
+  duplicate:
+    microbatch: 32
+    feature_dim: 384
+    candidate_k: 400
+    max_degree: 200
+    reference_block: 128
+    pair_batch_size: 256
+    lr: 0.001
+    weight_decay: 0.01
+    patience: 10
+    max_epochs: null
+    negative_ratio: 3
+
+service:
+  host: 0.0.0.0
+  port: 8000
+  callback_url: ""
+  # Default: deliver goals 1/2 to teammates, without announcing a complete submission.
+  callback_enabled: false
+  merge_from_template: null
+  callback_evaluation_id_type: string
+  callback_pred_path_template: null
+  callback_max_attempts: 5
+  callback_retry_seconds: 5
