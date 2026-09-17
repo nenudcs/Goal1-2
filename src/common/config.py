@@ -1,6 +1,12 @@
 from pathlib import Path
 import yaml
 
+
+def _is_absolute(value):
+    text = str(value)
+    return Path(text).is_absolute() or text.startswith("/")
+
+
 def load_config(path: str):
     path = Path(path)
     with path.open("r", encoding="utf-8") as f:
@@ -10,21 +16,19 @@ def load_config(path: str):
     project_root = path.resolve().parents[1]
     cfg["_project_root"] = str(project_root)
 
-    path_keys = cfg["paths"] if cfg.get("detection", {}).get("enabled") else (
-        "labels_dir", "checkpoints_dir", "output_dir")
-    for key in path_keys:
-        if cfg["paths"][key] is None:
-            continue
-        p = Path(cfg["paths"][key])
-        if not p.is_absolute():
+    for key in (
+        "annotation_root", "labels_dir", "checkpoints_dir", "output_dir",
+        "competition_log_dir", "answer_root",
+    ):
+        value = cfg["paths"][key]
+        p = Path(value)
+        if not _is_absolute(value):
             cfg["paths"][key] = str((project_root / p).resolve())
 
-    if cfg.get("detection", {}).get("enabled"):
-        for section in ("models", "data"):
-            for key, value in cfg["detection"][section].items():
-                if value and (key.endswith("_file") or section == "models"):
-                    p = Path(value)
-                    if not p.is_absolute():
-                        cfg["detection"][section][key] = str((project_root / p).resolve())
+    for section in ("abnormal", "duplicate"):
+        for key in ("checkpoint_path", "pretrained_path", "resume_path"):
+            value = cfg.get(section, {}).get(key, "")
+            if value and not _is_absolute(value):
+                cfg[section][key] = str((project_root / value).resolve())
 
     return cfg

@@ -15,6 +15,8 @@ from pydantic import BaseModel
 from src.common.config import load_config
 from src.common.train_utils import get_device
 from src.common.logging_utils import build_logger
+from src.pipeline.load_models import load_all_models
+from src.pipeline.batch_pipeline import run_batch
 
 app = FastAPI()
 logger = build_logger("competition_service")
@@ -48,7 +50,6 @@ def callback(request_id, evaluation_id, pred_path):
         logger.exception("Callback failed")
 
 def background_inference(payload):
-    from src.pipeline.batch_pipeline import run_batch
     request_id = payload["request_id"]
     inp = payload["input"]
     evaluation_id = str(inp.get("evaluation_id") or inp.get("evaluationId"))
@@ -83,10 +84,6 @@ def call(payload: CallPayload, background_tasks: BackgroundTasks):
 def main(config_path):
     global CFG, MODELS, DEVICE
     CFG = load_config(config_path)
-    if CFG.get("detection", {}).get("enabled"):
-        from service.detection_server import main as detection_main
-        return detection_main(config_path)
-    from src.pipeline.load_models import load_all_models
     DEVICE = get_device(CFG)
 
     logger.info("Loading models on %s ...", DEVICE)

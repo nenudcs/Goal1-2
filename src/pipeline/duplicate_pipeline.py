@@ -1,71 +1,78 @@
-from pathlib import Path
 import json
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 
-from src.pipeline.case_pipeline import list_series
-from src.data.nifti import load_preprocessed_volume, check_nifti
+from src.data.nifti import load_preprocessed_volume
+from src.data.paths import list_case_series
+
 
 @torch.no_grad()
 def encode_case(case_dir, model, cfg, device):
-    shape = cfg["data"]["target_shape"]
-    clip = cfg["data"]["intensity_clip_percentiles"]
-    vols = []
-    for _, p in list_series(case_dir):
-        if not check_nifti(p):
-            continue
-        try:
-            x, _ = load_preprocessed_volume(p, shape, clip)
-            vols.append(x)
-        except Exception as e:
-            print(f"[DuplicatePipeline][NIFTI SKIP] {p} | {type(e).__name__}: {e}")
-    if not vols:
+    volumes = []
+    for _, path in list_case_series(case_dir):
+        volume, _ = load_preprocessed_volume(
+            path, cfg["data"]["target_shape"],
+            cfg["data"]["intensity_clip_percentiles"],
+        )
+        volumes.append(volume)
+    if not volumes:
         return None
-    x = torch.stack(vols).to(device)
-    return model.encode_case(x).squeeze(0).cpu()
+    return model.encode_case(
+        torch.stack(volumes).to(device),
+        cfg["duplicate"].get("series_batch_size", 4),
+    ).squeeze(0).cpu()
+
 
 @torch.no_grad()
-def run_duplicate_pipeline(dataset_path, output_jsonl, model, cfg, device):
-    """
-    V1 为清晰起见使用全量 cosine，相当于 baseline。
-    提交前数据规模很大时可换 FAISS/ANN。
-    每例最终仅保留 Top-K。
-    """
-    dataset_path = Path(dataset_path)
-    case_dirs = [p for p in dataset_path.iterdir() if p.is_dir()]
+def run_duplicate_pipeline(case_dirs, output_jsonl, model, cfg, device):
+    ids, embeddings = [], []
+    for case_dir in sorted(map(Path, case_dirs)):
+        embedding = encode_case(case_dir, model, cfg, device)
+        if embedding is not None:
+            ids.append(case_dir.name)
+            embeddings.append(embedding)
+    if len(ids) < 2:
+        raise ValueError("Duplicate inference requires at least two readable cases.")
 
-    ids, embs = [], []
-    for cdir in sorted(case_dirs):
-        emb = encode_case(cdir, model, cfg, device)
-        if emb is not None:
-            ids.append(cdir.name)
-            embs.append(emb)
+    embeddings = F.normalize(torch.stack(embeddings), dim=1)
+    topk = min(int(cfg["duplicate"].get("topk_candidates", 200)), len(ids) - 1)
+    chunk_size = int(cfg["duplicate"].get("similarity_chunk_size", 256))
+    candidates = {}
+    scale = model.logit_scale.detach().cpu().exp().clamp(max=100.0)
+    bias = model.bias.detach().cpu()
+    for start in range(0, len(ids), chunk_size):
+        similarities = embeddings[start:start + chunk_size] @ embeddings.T
+        for local_index in range(similarities.shape[0]):
+            index = start + local_index
+            similarities[local_index, index] = -float("inf")
+            values, indices = torch.topk(similarities[local_index], k=topk)
+            for value, other in zip(values.tolist(), indices.tolist()):
+                pair = tuple(sorted((ids[index], ids[other])))
+                probability = float(torch.sigmoid(scale * value + bias))
+                candidates[pair] = max(candidates.get(pair, 0.0), probability)
 
-    if len(embs) < 2:
-        Path(output_jsonl).write_text("", encoding="utf-8")
-        return
+    degrees = {identifier: 0 for identifier in ids}
+    selected = []
+    for (a, b), probability in sorted(
+        candidates.items(), key=lambda item: item[1], reverse=True
+    ):
+        if degrees[a] >= topk or degrees[b] >= topk:
+            continue
+        selected.append((a, b, probability))
+        degrees[a] += 1
+        degrees[b] += 1
+    if not selected:
+        raise RuntimeError("Duplicate inference did not produce any valid pair.")
 
-    E = F.normalize(torch.stack(embs), dim=1)
-    sim = E @ E.T
-    sim.fill_diagonal_(-1)
-
-    topk = min(cfg["duplicate"]["topk_candidates"], len(ids)-1)
-    seen = {}
-
-    for i, a in enumerate(ids):
-        vals, inds = torch.topk(sim[i], k=topk)
-        for v, j in zip(vals.tolist(), inds.tolist()):
-            b = ids[j]
-            key = tuple(sorted((a, b)))
-            prob = float((v + 1.0) / 2.0)  # baseline: cosine [-1,1] -> [0,1]
-            seen[key] = max(seen.get(key, 0.0), prob)
-
-    out = Path(output_jsonl)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("w", encoding="utf-8") as f:
-        for (a, b), prob in sorted(seen.items(), key=lambda x: x[1], reverse=True):
-            f.write(json.dumps({
+    output_jsonl = Path(output_jsonl)
+    output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    with output_jsonl.open("w", encoding="utf-8") as stream:
+        for a, b, probability in selected:
+            stream.write(json.dumps({
                 "StudyUID": a,
                 "StudyUID_dup": b,
-                "PairProb": prob
+                "PairProb": probability,
             }, ensure_ascii=False) + "\n")
+    return selected

@@ -1,67 +1,99 @@
 import random
-from pathlib import Path
-import pandas as pd
+
 import torch
 from torch.utils.data import Dataset
-from src.data.paths import PathResolver
-from src.data.nifti import load_preprocessed_volume, check_nifti
 
-def build_negative_pairs(abnormal_xlsx, positive_xlsx, negative_ratio=3, seed=42):
-    rng=random.Random(seed)
-    adf=pd.read_excel(abnormal_xlsx); adf['AccessionNumber']=adf['AccessionNumber'].astype(str)
-    true_ids=sorted(adf.loc[adf['Label'].astype(str).str.lower().eq('true'),'AccessionNumber'].drop_duplicates().tolist())
-    pdf=pd.read_excel(positive_xlsx); pdf['src_img']=pdf['src_img'].astype(str); pdf['desc_img']=pdf['desc_img'].astype(str)
-    positive_set={tuple(sorted((a,b))) for a,b in zip(pdf['src_img'],pdf['desc_img'])}
-    n_needed=len(pdf)*int(negative_ratio); negatives=set(); attempts=0; max_attempts=max(1000,n_needed*100)
-    if len(true_ids)<2: return []
-    while len(negatives)<n_needed and attempts<max_attempts:
-        attempts+=1; a,b=rng.sample(true_ids,2); pair=tuple(sorted((a,b)))
-        if pair not in positive_set: negatives.add(pair)
-    return [(a,b,0) for a,b in sorted(negatives)]
+from src.data.nifti import load_preprocessed_volume
+from src.data.paths import PathResolver, read_manifest
 
-def _list_series_under_accession(accession_dir: Path):
-    items=[]
-    if not accession_dir.exists(): return items
-    for sd in sorted(accession_dir.iterdir()):
-        if not sd.is_dir(): continue
-        p=sd/f'{sd.name}.nii.gz'
-        if p.is_file() and check_nifti(p): items.append(p)
-    return items
+
+def read_positive_pairs(manifest_path):
+    frame = read_manifest(manifest_path)
+    required = {"src_img", "desc_img"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"Duplicate manifest is missing columns: {sorted(missing)}")
+    pairs = set()
+    for a, b in zip(frame["src_img"], frame["desc_img"]):
+        a, b = str(a).strip(), str(b).strip()
+        if a and b and a != b:
+            pairs.add(tuple(sorted((a, b))))
+    return sorted(pairs)
+
+
+def build_negative_pairs(accessions, positive_pairs, negative_ratio=3, seed=42):
+    accessions = sorted(set(map(str, accessions)))
+    positive_set = set(positive_pairs)
+    possible = len(accessions) * (len(accessions) - 1) // 2 - len(positive_set)
+    needed = min(possible, len(positive_set) * int(negative_ratio))
+    if needed <= 0:
+        return []
+    rng = random.Random(seed)
+    negatives = set()
+    for _ in range(max(100, needed * 20)):
+        if len(negatives) >= needed:
+            break
+        pair = tuple(sorted(rng.sample(accessions, 2)))
+        if pair not in positive_set:
+            negatives.add(pair)
+    if len(negatives) < needed:
+        for index, a in enumerate(accessions):
+            for b in accessions[index + 1:]:
+                pair = (a, b)
+                if pair not in positive_set:
+                    negatives.add(pair)
+                if len(negatives) >= needed:
+                    break
+            if len(negatives) >= needed:
+                break
+    return sorted(negatives)
+
 
 class DuplicatePairDataset(Dataset):
-    def __init__(self, positive_xlsx, abnormal_xlsx, annotation_root, target_shape, clip_percentiles, negative_ratio=3, seed=42, accessions=None):
-        self.resolver=PathResolver(annotation_root); self.target_shape=target_shape; self.clip_percentiles=clip_percentiles
-        pdf=pd.read_excel(positive_xlsx)
-        positives=[(str(a),str(b),1) for a,b in zip(pdf['src_img'],pdf['desc_img'])]
-        negatives=build_negative_pairs(abnormal_xlsx,positive_xlsx,negative_ratio,seed)
-        items=positives+negatives
-        allowed=set(map(str,accessions)) if accessions is not None else None
-        self.items=[]; skipped=[]
-        for a,b,y in items:
-            if allowed is not None and not (a in allowed and b in allowed): continue
-            pos=(y==1)
-            da=self.resolver.duplicate_accession_dir(a) if pos else self.resolver.root/a
-            db=self.resolver.duplicate_accession_dir(b) if pos else self.resolver.root/b
-            sa=_list_series_under_accession(da); sb=_list_series_under_accession(db)
-            if not sa or not sb:
-                skipped.append((a,b,y,len(sa),len(sb))); continue
-            self.items.append((a,b,y))
-        print(f'[DuplicatePairDataset] original_pairs={len(items)} valid_pairs={len(self.items)} missing_or_broken_skipped={len(skipped)}')
-        for x in skipped: print(f'[DuplicatePairDataset][SKIP] pair={x[:3]} seriesA={x[3]} seriesB={x[4]}')
-    def __len__(self): return len(self.items)
-    def _case_volume_list(self,accession,positive_side=False):
-        base=self.resolver.duplicate_accession_dir(accession) if positive_side else self.resolver.root/accession
-        paths=_list_series_under_accession(base); vols=[]
-        for p in paths:
-            try:
-                x,_=load_preprocessed_volume(p,self.target_shape,self.clip_percentiles); vols.append(x)
-            except Exception as e:
-                print(f'[DuplicatePairDataset][NIFTI SKIP] {p} | {type(e).__name__}: {e}')
-        if not vols: raise RuntimeError(f'No valid NIfTI for case {accession}')
-        return torch.stack(vols,dim=0)
-    def __getitem__(self,idx):
-        a,b,y=self.items[idx]; pos=(y==1)
-        return self._case_volume_list(a,pos),self._case_volume_list(b,pos),torch.tensor(float(y)),a,b
+    def __init__(
+        self, positive_manifest, annotation_root, target_shape, clip_percentiles,
+        negative_ratio=3, seed=42, accessions=None, source_dirs=None,
+    ):
+        self.resolver = PathResolver(annotation_root, source_dirs=source_dirs)
+        self.target_shape = target_shape
+        self.clip_percentiles = clip_percentiles
+        available = {
+            identifier for identifier in self.resolver.duplicate_accessions()
+            if self.resolver.list_case_series(
+                self.resolver.duplicate_accession_dir(identifier)
+            )
+        }
+        allowed = available if accessions is None else available & set(map(str, accessions))
+        positives = [
+            pair for pair in read_positive_pairs(positive_manifest)
+            if pair[0] in allowed and pair[1] in allowed
+        ]
+        negatives = build_negative_pairs(allowed, positives, negative_ratio, seed)
+        self.items = [(a, b, 1.0) for a, b in positives]
+        self.items += [(a, b, 0.0) for a, b in negatives]
+        if not self.items:
+            raise ValueError("Duplicate dataset contains no usable pairs.")
+
+    def __len__(self):
+        return len(self.items)
+
+    def _load_case(self, accession):
+        paths = self.resolver.list_case_series(
+            self.resolver.duplicate_accession_dir(accession)
+        )
+        if not paths:
+            raise RuntimeError(f"No valid NIfTI series in duplicate/{accession}")
+        volumes = [
+            load_preprocessed_volume(path, self.target_shape, self.clip_percentiles)[0]
+            for path in paths
+        ]
+        return torch.stack(volumes)
+
+    def __getitem__(self, idx):
+        a, b, label = self.items[idx]
+        return self._load_case(a), self._load_case(b), torch.tensor(label), a, b
+
 
 def duplicate_collate(batch):
-    xa,xb,y,a,b=zip(*batch); return list(xa),list(xb),torch.stack(y),list(a),list(b)
+    xa, xb, labels, a, b = zip(*batch)
+    return list(xa), list(xb), torch.stack(labels), list(a), list(b)

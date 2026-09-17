@@ -1,44 +1,117 @@
 from pathlib import Path
 import sys
-PROJECT_ROOT=Path(__file__).resolve().parent.parent
-sys.path.insert(0,str(PROJECT_ROOT))
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
 import argparse
+
 import pandas as pd
+
 from src.common.config import load_config
 from src.common.logging_utils import build_logger
-from src.data.paths import PathResolver
 from src.data.nifti import check_nifti
+from src.data.paths import PathResolver, read_manifest
+from src.tasks.abnormal.dataset import normalize_abnormal_labels
+from src.tasks.duplicate.dataset import read_positive_pairs
 
-def main(cfg):
-    logger=build_logger('validate_data'); labels=Path(cfg['paths']['labels_dir']); resolver=PathResolver(cfg['paths']['annotation_root']); report_dir=Path(cfg['paths']['output_dir'])/'data_validation'; report_dir.mkdir(parents=True,exist_ok=True)
-    required=['1_abnormal.xlsx','2_duplicate.xlsx','3_serieslabel.xlsx','4_masklabel.xlsx','5_characteristics.xlsx']
-    logger.info('========== Data validation (missing/broken files are skipped) ==========')
-    for name in required: logger.info('Found label file: %s',labels/name) if (labels/name).exists() else logger.error('Missing label file: %s',labels/name)
-    records=[]
-    p=labels/'1_abnormal.xlsx'
-    if p.exists():
-        df=pd.read_excel(p); df['Label']=df['Label'].astype(str).str.lower(); logger.info('[1_abnormal] label counts:\n%s',df['Label'].value_counts().to_string())
-        for i,r in df.iterrows():
-            path=resolver.series_path(str(r['AccessionNumber']),str(r['SeriesUid']),str(r['Label'])); ok=check_nifti(path);
-            if not ok: records.append({'table':'1_abnormal','row':int(i)+2,'AccessionNumber':str(r['AccessionNumber']),'SeriesUid':str(r['SeriesUid']),'type':'missing_or_broken_image','path':str(path)})
-        logger.info('[1_abnormal] rows=%d invalid_skipped=%d',len(df),sum(x['table']=='1_abnormal' for x in records))
-    p=labels/'3_serieslabel.xlsx'
-    if p.exists():
-        df=pd.read_excel(p); bad=0
-        for i,r in df.iterrows():
-            path=resolver.series_path(str(r['AccessionNumber']),str(r['SeriesUid']),'true');
-            if not check_nifti(path): bad+=1; records.append({'table':'3_serieslabel','row':int(i)+2,'AccessionNumber':str(r['AccessionNumber']),'SeriesUid':str(r['SeriesUid']),'type':'missing_or_broken_image','path':str(path)})
-        logger.info('[3_serieslabel] rows=%d invalid_skipped=%d',len(df),bad); logger.info('class counts:\n%s',df['SeriesLabel'].value_counts(dropna=False).to_string())
-    p=labels/'4_masklabel.xlsx'
-    if p.exists():
-        df=pd.read_excel(p); bi= bm=0
-        for i,r in df.iterrows():
-            img=resolver.series_path(str(r['AccessionNumber']),str(r['SeriesUid']),'true'); mask=resolver.mask_path(str(r['AccessionNumber']),str(r['SeriesUid']),str(r['Maskname']))
-            if not check_nifti(img): bi+=1; records.append({'table':'4_masklabel','row':int(i)+2,'AccessionNumber':str(r['AccessionNumber']),'SeriesUid':str(r['SeriesUid']),'type':'missing_or_broken_image','path':str(img)})
-            if not check_nifti(mask): bm+=1; records.append({'table':'4_masklabel','row':int(i)+2,'AccessionNumber':str(r['AccessionNumber']),'SeriesUid':str(r['SeriesUid']),'type':'missing_or_broken_mask','path':str(mask)})
-        logger.info('[4_masklabel] rows=%d invalid_images=%d invalid_masks=%d',len(df),bi,bm)
-    out=report_dir/'invalid_files.csv'; pd.DataFrame(records).to_csv(out,index=False,encoding='utf-8-sig')
-    logger.info('Validation finished. Invalid/missing report: %s',out)
 
-if __name__=='__main__':
-    parser=argparse.ArgumentParser(); parser.add_argument('--config',default='configs/config.yaml'); args=parser.parse_args(); main(load_config(args.config))
+def validate_abnormal(cfg, records):
+    manifest = Path(cfg["paths"]["labels_dir"]) / cfg["abnormal"]["manifest"]
+    if not manifest.is_file():
+        records.append({"table": "1_abnormal", "type": "missing_manifest", "path": str(manifest)})
+        return
+    try:
+        frame = normalize_abnormal_labels(
+            read_manifest(manifest), cfg["abnormal"].get("label_aliases")
+        )
+    except Exception as error:
+        records.append({"table": "1_abnormal", "type": "invalid_schema_or_label", "detail": str(error)})
+        return
+    resolver = PathResolver(
+        cfg["paths"]["annotation_root"], cfg["data"].get("source_dirs")
+    )
+    for index, row in frame.iterrows():
+        if not row["AccessionNumber"] or not row["SeriesUid"]:
+            records.append({"table": "1_abnormal", "row": index + 2, "type": "empty_id"})
+            continue
+        path = resolver.series_path(
+            row["AccessionNumber"], row["SeriesUid"], row["Label"]
+        )
+        if not check_nifti(path):
+            records.append({
+                "table": "1_abnormal", "row": index + 2,
+                "AccessionNumber": row["AccessionNumber"],
+                "SeriesUid": row["SeriesUid"],
+                "type": "missing_or_broken_image", "path": str(path),
+            })
+
+
+def validate_duplicate(cfg, records):
+    manifest = Path(cfg["paths"]["labels_dir"]) / cfg["duplicate"]["manifest"]
+    if not manifest.is_file():
+        records.append({"table": "2_duplicate", "type": "missing_manifest", "path": str(manifest)})
+        return
+    try:
+        frame = read_manifest(manifest)
+        required = {"src_img", "desc_img"}
+        if missing := required - set(frame.columns):
+            raise ValueError(f"missing columns: {sorted(missing)}")
+        pairs = read_positive_pairs(manifest)
+    except Exception as error:
+        records.append({"table": "2_duplicate", "type": "invalid_schema", "detail": str(error)})
+        return
+    resolver = PathResolver(
+        cfg["paths"]["annotation_root"], cfg["data"].get("source_dirs")
+    )
+    seen, ids = set(), set()
+    for index, row in frame.iterrows():
+        a, b = str(row["src_img"]).strip(), str(row["desc_img"]).strip()
+        pair = tuple(sorted((a, b)))
+        if not a or not b:
+            records.append({"table": "2_duplicate", "row": index + 2, "type": "empty_id"})
+        elif a == b:
+            records.append({"table": "2_duplicate", "row": index + 2, "type": "self_pair", "id": a})
+        elif pair in seen:
+            records.append({"table": "2_duplicate", "row": index + 2, "type": "duplicate_pair", "detail": str(pair)})
+        seen.add(pair)
+        ids.update((a, b))
+    available_ids = set(resolver.duplicate_accessions())
+    if not available_ids:
+        records.append({"table": "2_duplicate", "type": "missing_or_empty_duplicate_directory"})
+    for identifier in sorted(ids | available_ids):
+        case_dir = resolver.duplicate_accession_dir(identifier)
+        if not resolver.list_case_series(case_dir):
+            records.append({
+                "table": "2_duplicate", "AccessionNumber": identifier,
+                "type": "missing_or_broken_duplicate_case", "path": str(case_dir),
+            })
+    if not pairs:
+        records.append({"table": "2_duplicate", "type": "no_valid_pairs"})
+
+
+def main(cfg, tasks):
+    logger = build_logger("validate_data")
+    records = []
+    tasks = set(tasks)
+    if "goal1" in tasks or "goal2" in tasks:
+        validate_abnormal(cfg, records)
+    if "goal2" in tasks:
+        validate_duplicate(cfg, records)
+    report_dir = Path(cfg["paths"]["output_dir"]) / "data_validation"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report = report_dir / "goal1and2_issues.csv"
+    pd.DataFrame(records).to_csv(report, index=False, encoding="utf-8-sig")
+    if records:
+        logger.error("Validation found %d issue(s). Report: %s", len(records), report)
+        return 1
+    logger.info("Goal 1/2 validation passed. Report: %s", report)
+    return 0
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/config.yaml")
+    parser.add_argument("--tasks", nargs="+", choices=("goal1", "goal2"), default=("goal1", "goal2"))
+    arguments = parser.parse_args()
+    raise SystemExit(main(load_config(arguments.config), arguments.tasks))

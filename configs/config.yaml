@@ -3,32 +3,55 @@ project:
   num_workers: 4
   device: cuda
   amp: true
+  pin_memory: true
 
 paths:
   annotation_root: /2026aicompetition/datasets/training/annotation
   labels_dir: ./labels
   checkpoints_dir: ./checkpoints
   output_dir: ./outputs
-  competition_log_dir: /2026aicompetition/workspace/logs
-  answer_root: /2026aicompetition/workspace/answer
+#  competition_log_dir: /2026aicompetition/workspace/logs
+  competition_log_dir: ./logs
+#  answer_root: /2026aicompetition/workspace/answer
+  answer_root: ./answer
 
 data:
+  input_format: nifti
   target_shape: [96, 128, 128]
   intensity_clip_percentiles: [0.5, 99.5]
+  case_aggregation: max
+  source_dirs:
+    "true": ""
+    fake: fake
+    nonhuman: fake
+    composition: Composition
+    duplicate: duplicate
 
 split:
   val_ratio: 0.1
   random_state: 42
 
 training:
-  batch_size: 2
+  batch_size: 4
   epochs: 20
   lr: 0.0003
   weight_decay: 0.00001
   log_every: 10
+  resume: ""
 
 abnormal:
   num_classes: 3
+  class_names: ["true", "fake", "composition"]
+  label_aliases:
+    "true": "true"
+    "fake": "fake"
+    "nonhuman": "fake"
+    "composition": "composition"
+    "compositing": "composition"
+  manifest: 1_abnormal.xlsx
+  checkpoint_path: ./checkpoints/abnormal/best.pth
+  pretrained_path: ""
+  resume_path: ""
 
 sequence:
   num_classes: 3
@@ -43,8 +66,13 @@ characteristics:
 duplicate:
   embedding_dim: 128
   negative_ratio: 3
-  topk_candidates: 50
-  margin: 0.25
+  topk_candidates: 200
+  similarity_chunk_size: 256
+  series_batch_size: 4
+  manifest: 2_duplicate.xlsx
+  checkpoint_path: ./checkpoints/duplicate/best.pth
+  pretrained_path: ""
+  resume_path: ""
 
 service:
   host: 0.0.0.0
